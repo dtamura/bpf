@@ -3,6 +3,7 @@
 #include "vmlinux.h"
 
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
@@ -122,6 +123,7 @@ int BPF_KRETPROBE(kretprobe__tcp_v4_connect, long ret) {
 	// 情報収集
 	conn_tuple_t key = {};
 	init_conn_tuple_t(&key);
+	key.pid = pid;
 	// src / dst addr
 	BPF_CORE_READ_INTO((u32 *)(&key.saddr_l), skp, __sk_common.skc_rcv_saddr);
 	BPF_CORE_READ_INTO((u32 *)(&key.daddr_l), skp, __sk_common.skc_daddr);
@@ -131,7 +133,9 @@ int BPF_KRETPROBE(kretprobe__tcp_v4_connect, long ret) {
 		bpf_printk("ERR(read_conn_tuple.v4): src or dst addr not set src=%d, dst=%d\n", key.saddr_l, key.daddr_l);
 	}
 	// port
-	BPF_CORE_READ_INTO(&key.dport, skp, __sk_common.skc_dport);
+	__u16 dport = 0;
+	BPF_CORE_READ_INTO(&dport, skp, __sk_common.skc_dport);
+	key.dport = bpf_ntohs(dport); // バイトオーダー
 	BPF_CORE_READ_INTO(&key.sport, skp, __sk_common.skc_num);
 	bpf_printk("sport=%d, dport=%d\n", key.sport, key.dport);
 	if (key.sport == 0 || key.dport == 0) {
@@ -144,19 +148,20 @@ int BPF_KRETPROBE(kretprobe__tcp_v4_connect, long ret) {
 
 	bpf_map_update_elem(&conn_stats, &key, &empty, BPF_NOEXIST);
 	conn_stats_ts_t *val = bpf_map_lookup_elem(&conn_stats, &key);
-	if(!val) {
+	if (!val) {
 		return 0;
 	}
-	u64 ts = bpf_ktime_get_ns();
+	u64 ts         = bpf_ktime_get_ns();
+	bpf_printk("%lu", ts);
 	val->timestamp = ts;
 	u64 sent_bytes = 0;
 	if (sent_bytes) {
-        __sync_fetch_and_add(&val->sent_bytes, sent_bytes);
-    }
+		__sync_fetch_and_add(&val->sent_bytes, sent_bytes);
+	}
 	u64 recv_bytes = 0;
 	if (recv_bytes) {
-        __sync_fetch_and_add(&val->recv_bytes, recv_bytes);
-    }
+		__sync_fetch_and_add(&val->recv_bytes, recv_bytes);
+	}
 
 	return 0;
 }

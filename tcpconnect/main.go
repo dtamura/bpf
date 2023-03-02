@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"path"
 	"strings"
@@ -38,17 +39,22 @@ func main() {
 	// }
 
 	// Attach the program.
-	kp, err := link.Kprobe("tcp_v4_connect", bpfObjs.TcpV4Connect, nil)
+	kp, err := link.Kprobe("tcp_v4_connect", bpfObjs.KprobeTcpV4Connect, nil)
 	if err != nil {
 		log.Fatalf("opening kprobe: %s", err)
 	}
 	defer kp.Close()
+	krp, err := link.Kretprobe("tcp_v4_connect", bpfObjs.KretprobeTcpV4Connect, nil)
+	if err != nil {
+		log.Fatalf("opening kprobe: %s", err)
+	}
+	defer krp.Close()
 
 	// Print the contents of the BPF hash map (source IP address -> packet count).
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		s, err := formatMapContents(bpfObjs.PktCounter)
+		s, err := formatMapContents(bpfObjs.ConnStats)
 		if err != nil {
 			log.Printf("Error reading map: %s", err)
 			continue
@@ -61,14 +67,39 @@ func main() {
 func formatMapContents(m *ebpf.Map) (string, error) {
 	var (
 		sb  strings.Builder
-		key uint32
-		val uint32
+		key tcpconnectConnTupleT
+		val tcpconnectConnStatsTsT
 	)
 
 	iter := m.Iterate()
 	for iter.Next(&key, &val) {
-		packetCount := val
-		sb.WriteString(fmt.Sprintf("\t%d => %d\n", key, packetCount))
+		saddr := formatIPv4Address(key.SaddrL)
+		daddr := formatIPv4Address(key.DaddrL)
+		sb.WriteString(
+			fmt.Sprintf("\tPID:%d\t%s\t%s:%d => %s:%d\n",
+				key.Pid,
+				formatTimestamp(val.Timestamp),
+				saddr,
+				key.Sport,
+				daddr,
+				key.Dport,
+			))
 	}
+
 	return sb.String(), iter.Err()
+}
+
+func formatIPv4Address(addr uint64) string {
+	return netip.AddrFrom4([4]byte{
+		uint8(addr),
+		uint8(addr >> 8),
+		uint8(addr >> 16),
+		uint8(addr >> 24),
+	}).String()
+}
+
+func formatTimestamp(ts uint64) string {
+	fmt.Printf("%v\n", ts)
+	t := time.Unix(0, int64(ts)) // TODO boot時刻と足す
+	return t.Format("2006-01-02T15:04:05Z07:00")
 }
