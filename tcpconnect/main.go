@@ -56,6 +56,16 @@ func main() {
 		log.Fatalf("opening kprobe: %s", err)
 	}
 	defer krp.Close()
+	kp1, err := link.Kprobe("tcp_finish_connect", bpfObjs.KprobeTcpFinishConnect, nil)
+	if err != nil {
+		log.Fatalf("opening kprobe: %s", err)
+	}
+	defer kp1.Close()
+	kp2, err := link.Kprobe("tcp_close", bpfObjs.KprobeTcpClose, nil)
+	if err != nil {
+		log.Fatalf("opening kprobe: %s", err)
+	}
+	defer kp2.Close()
 
 	// Print the contents of the BPF hash map (source IP address -> packet count).
 	ticker := time.NewTicker(1 * time.Second)
