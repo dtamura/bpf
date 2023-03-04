@@ -11,11 +11,18 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/shirou/gopsutil/v3/host"
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -Wall -g -Werror -D __TARGET_ARCH_x86" tcpconnect tcpconnect.c
 
+var (
+	bootTimeSec uint64 // BPFで記録されるtimestampはboot時からのnsecなので
+)
+
 func main() {
+
+	bootTimeSec, _ = host.BootTime()
 
 	bpfFSPath := "/sys/fs/bpf"
 	pinPath := path.Join(bpfFSPath, "tcpconnect")
@@ -54,7 +61,7 @@ func main() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		s, err := formatMapContents(bpfObjs.ConnStats)
+		s, err := formatMapContents(&bpfObjs)
 		if err != nil {
 			log.Printf("Error reading map: %s", err)
 			continue
@@ -64,25 +71,33 @@ func main() {
 
 }
 
-func formatMapContents(m *ebpf.Map) (string, error) {
+func formatMapContents(o *tcpconnectObjects) (string, error) {
 	var (
 		sb  strings.Builder
 		key tcpconnectConnTupleT
 		val tcpconnectConnStatsTsT
 	)
 
-	iter := m.Iterate()
+	cm := o.ConnStats
+	tm := o.TcpStats
+	iter := cm.Iterate()
+
 	for iter.Next(&key, &val) {
 		saddr := formatIPv4Address(key.SaddrL)
 		daddr := formatIPv4Address(key.DaddrL)
+
+		var rtt uint32
+		tm.Lookup(&key, &rtt)
+
 		sb.WriteString(
-			fmt.Sprintf("\tPID:%d\t%s\t%s:%d => %s:%d\n",
+			fmt.Sprintf("\tPID:%d\t%s\t%s:%d => %s:%d RTT: %dnsec\n",
 				key.Pid,
 				formatTimestamp(val.Timestamp),
 				saddr,
 				key.Sport,
 				daddr,
 				key.Dport,
+				rtt,
 			))
 	}
 
@@ -99,7 +114,6 @@ func formatIPv4Address(addr uint64) string {
 }
 
 func formatTimestamp(ts uint64) string {
-	fmt.Printf("%v\n", ts)
-	t := time.Unix(0, int64(ts)) // TODO boot時刻と足す
-	return t.Format("2006-01-02T15:04:05Z07:00")
+	t := time.Unix(int64(bootTimeSec), int64(ts))
+	return t.Format(time.RFC3339Nano)
 }
