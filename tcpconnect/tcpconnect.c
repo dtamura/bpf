@@ -137,6 +137,15 @@ typedef struct
 	tcp_stats_t tcp_stats;
 } conn_t;
 
+// tcp_sendmsg() 用のskp格納用
+struct
+{
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u64);
+	__type(value, struct sock *);
+	__uint(max_entries, 1024);
+} tcp_sendmsg_args SEC(".maps");
+
 // struct sockからコネクション情報を読み出す
 // 成功で1, 失敗は0を返却
 static __always_inline int read_conn_tuple(conn_tuple_t *t, struct sock *skp, u64 pid_tgid)
@@ -171,6 +180,7 @@ static __always_inline int read_conn_tuple(conn_tuple_t *t, struct sock *skp, u6
 	else
 	{
 		bpf_printk("ERR: not ipv4 family: __skc_family=%u", family);
+		return 0;
 	}
 
 	// port
@@ -246,14 +256,14 @@ static __always_inline void update_conn_stats(conn_tuple_t *key, size_t sent_byt
 		return;
 	}
 	val->timestamp = ts;
-	// u64 sent_bytes = 0;
-	// if (sent_bytes) {
-	// 	__sync_fetch_and_add(&val->sent_bytes, sent_bytes);
-	// }
-	// u64 recv_bytes = 0;
-	// if (recv_bytes) {
-	// 	__sync_fetch_and_add(&val->recv_bytes, recv_bytes);
-	// }
+	if (sent_bytes)
+	{
+		__sync_fetch_and_add(&val->sent_bytes, sent_bytes);
+	}
+	if (recv_bytes)
+	{
+		__sync_fetch_and_add(&val->recv_bytes, recv_bytes);
+	}
 }
 
 static __always_inline int handle_message(conn_tuple_t *t, size_t sent_bytes, size_t recv_bytes, struct sock *skp)
@@ -286,6 +296,8 @@ static __always_inline __attribute__((unused)) void cleanup_conn(conn_tuple_t *t
 		bpf_map_delete_elem(&conn_stats, &(conn.tup));
 	}
 }
+
+/*****************************************/
 
 SEC("kprobe/tcp_v4_connect")
 int BPF_KPROBE(kprobe__tcp_v4_connect, struct sock *skp)
@@ -344,6 +356,8 @@ int BPF_KRETPROBE(kretprobe__tcp_v4_connect, long ret)
 	return 0;
 }
 
+/*****************************************/
+
 SEC("kprobe/tcp_finish_connect")
 int BPF_KPROBE(kprobe__tcp_finish_connect, struct sock *sk, struct sk_buff *skb)
 {
@@ -371,6 +385,63 @@ int BPF_KPROBE(kprobe__tcp_finish_connect, struct sock *sk, struct sk_buff *skb)
 	return 0;
 }
 
+/*****************************************/
+SEC("kprobe/tcp_sendmsg")
+int BPF_KPROBE(kprobe__tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
+{
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	// bpf_printk("kprobe/tcp_sendmsg: pid_tgid: %u\n", pid_tgid >> 32);
+	struct sock *skp = sk;
+
+	bpf_map_update_elem(&tcp_sendmsg_args, &pid_tgid, &skp, BPF_ANY);
+	return 0;
+}
+
+SEC("kretprobe/tcp_sendmsg")
+int BPF_KRETPROBE(kretprobe__tcp_sendmsg, long ret)
+{
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct sock **skpp = bpf_map_lookup_elem(&tcp_sendmsg_args, &pid_tgid);
+	if (!skpp)
+	{
+		bpf_printk("kretprobe/tcp_sendmsg: sock not found\n");
+		return 0;
+	}
+
+	struct sock *skp = *skpp;
+	bpf_map_delete_elem(&tcp_sendmsg_args, &pid_tgid);
+
+	if (ret < 0)
+	{
+		bpf_printk("kretprobe/tcp_sendmsg: tcp_sendmsg err=%ld, pid=%u\n", ret, pid_tgid >> 32);
+		return 0;
+	}
+
+	if (!skp)
+	{
+		return 0;
+	}
+
+	bpf_printk("kretprobe/tcp_sendmsg: pid_tgid: %d, sent: %d, sock: %x\n", pid_tgid >> 32, ret, skp);
+	conn_tuple_t key = {};
+	init_conn_tuple_t(&key);
+	if (!read_conn_tuple(&key, skp, pid_tgid))
+	{
+		return 0;
+	}
+
+	handle_tcp_stats(&key, skp, 0);
+
+	__u32 packets_in = 0;
+	__u32 packets_out = 0;
+	BPF_CORE_READ_INTO(&packets_out, (struct tcp_sock *)(skp), segs_out);
+	BPF_CORE_READ_INTO(&packets_in, (struct tcp_sock *)(skp), segs_in);
+
+	return handle_message(&key, ret, 0, skp);
+}
+
+/*****************************************/
+
 SEC("kprobe/tcp_set_state")
 int BPF_KPROBE(kprobe__tcp_set_state, struct sock *sk, int state)
 {
@@ -395,6 +466,8 @@ int BPF_KPROBE(kprobe__tcp_set_state, struct sock *sk, int state)
 
 	return 0;
 }
+
+/*****************************************/
 
 SEC("kprobe/tcp_close")
 int BPF_KPROBE(kprobe__tcp_close, struct sock *sk, long timeout)
