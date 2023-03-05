@@ -11,6 +11,10 @@
 #define TASK_COMM_LEN 16
 #endif
 
+// inlude/linux/socket.h
+#define AF_INET 2	/* Internet IP Protocol 	*/
+#define AF_INET6 10 /* IP version 6			*/
+
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 struct
@@ -147,14 +151,26 @@ static __always_inline int read_conn_tuple(conn_tuple_t *t, struct sock *skp, u6
 	BPF_CORE_READ_INTO(&net_ns_inum, ct_net, ns.inum);
 	t->netns = net_ns_inum;
 
-	// src / dst addr
-	BPF_CORE_READ_INTO((u32 *)(&t->saddr_l), skp, __sk_common.skc_rcv_saddr);
-	BPF_CORE_READ_INTO((u32 *)(&t->daddr_l), skp, __sk_common.skc_daddr);
+	// family
+	unsigned short family = 0;
+	BPF_PROBE_READ_INTO(&family, skp, __sk_common.skc_family);
 
-	if (t->saddr_l == 0 || t->daddr_l == 0)
+	// addr
+	if (family == AF_INET)
+	{ // IPv4
+		t->metadata |= CONN_V4;
+		BPF_CORE_READ_INTO((u32 *)(&t->saddr_l), skp, __sk_common.skc_rcv_saddr);
+		BPF_CORE_READ_INTO((u32 *)(&t->daddr_l), skp, __sk_common.skc_daddr);
+
+		if (t->saddr_l == 0 || t->daddr_l == 0)
+		{
+			bpf_printk("ERR(read_conn_tuple.v4): src or dst addr not set src=%d, dst=%d\n", t->saddr_l, t->daddr_l);
+			return 0;
+		}
+	}
+	else
 	{
-		bpf_printk("ERR(read_conn_tuple.v4): src or dst addr not set src=%d, dst=%d\n", t->saddr_l, t->daddr_l);
-		return 0;
+		bpf_printk("ERR: not ipv4 family: __skc_family=%u", family);
 	}
 
 	// port
@@ -247,7 +263,7 @@ static __always_inline int handle_message(conn_tuple_t *t, size_t sent_bytes, si
 	return 0;
 }
 
-static __always_inline void cleanup_conn(conn_tuple_t *t, struct sock *sk)
+static __always_inline __attribute__((unused)) void cleanup_conn(conn_tuple_t *t, struct sock *sk)
 {
 	conn_t conn = {.tup = *t};
 	conn_stats_ts_t *cst = NULL;
@@ -355,6 +371,31 @@ int BPF_KPROBE(kprobe__tcp_finish_connect, struct sock *sk, struct sk_buff *skb)
 	return 0;
 }
 
+SEC("kprobe/tcp_set_state")
+int BPF_KPROBE(kprobe__tcp_set_state, struct sock *sk, int state)
+{
+	struct sock *skp = sk;
+	u8 new_state = (u8)state;
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	conn_tuple_t key = {};
+	init_conn_tuple_t(&key);
+
+	if (!read_conn_tuple(&key, skp, pid_tgid))
+	{
+		return 0;
+	}
+
+	u8 old_state = 0;
+	BPF_CORE_READ_INTO(&old_state, skp, __sk_common.skc_state);
+
+	bpf_printk("kprobe/tcp_set_state: state: %u => %u\n", old_state, new_state);
+
+	tcp_stats_t stats = {.state_transitions = (1 << state)};
+	update_tcp_stats(&key, stats);
+
+	return 0;
+}
+
 SEC("kprobe/tcp_close")
 int BPF_KPROBE(kprobe__tcp_close, struct sock *sk, long timeout)
 {
@@ -376,7 +417,7 @@ int BPF_KPROBE(kprobe__tcp_close, struct sock *sk, long timeout)
 	}
 	bpf_printk("kprobe/tcp_close: pid: %u, netns: %u, sport: %u, dport: %u\n", pid_tgid >> 32, key.netns, key.sport, key.dport);
 
-	cleanup_conn(&key, skp);
+	// cleanup_conn(&key, skp);
 
 	return 0;
 }
