@@ -18,6 +18,25 @@ import (
 
 var (
 	bootTimeSec uint64 // BPFで記録されるtimestampはboot時からのnsecなので
+
+)
+
+// ref: net/tcp_state.h
+// https://elixir.bootlin.com/linux/latest/source/include/net/tcp_states.h
+const (
+	TCP_ESTABLISHED = iota
+	TCP_SYN_SENT
+	TCP_SYN_RECV
+	TCP_FIN_WAIT1
+	TCP_FIN_WAIT2
+	TCP_TIME_WAIT
+	TCP_CLOSE
+	TCP_CLOSE_WAIT
+	TCP_LAST_ACK
+	TCP_LISTEN
+	TCP_CLOSING
+	TCP_NEW_SYN_RECV
+	TCP_MAX_STATES
 )
 
 func main() {
@@ -56,11 +75,11 @@ func main() {
 		log.Fatalf("opening kprobe: %s", err)
 	}
 	defer krp.Close()
-	kp1, err := link.Kprobe("tcp_finish_connect", bpfObjs.KprobeTcpFinishConnect, nil)
-	if err != nil {
-		log.Fatalf("opening kprobe: %s", err)
-	}
-	defer kp1.Close()
+	// kp1, err := link.Kprobe("tcp_finish_connect", bpfObjs.KprobeTcpFinishConnect, nil)
+	// if err != nil {
+	// 	log.Fatalf("opening kprobe: %s", err)
+	// }
+	// defer kp1.Close()
 	kp2, err := link.Kprobe("tcp_set_state", bpfObjs.KprobeTcpSetState, nil)
 	if err != nil {
 		log.Fatalf("opening kprobe: %s", err)
@@ -81,6 +100,16 @@ func main() {
 		log.Fatalf("opening kprobe: %s", err)
 	}
 	defer kp4.Close()
+	kp5, err := link.Kprobe("tcp_recvmsg", bpfObjs.KprobeTcpRecvmsg, nil)
+	if err != nil {
+		log.Fatalf("opening kprobe: %s", err)
+	}
+	defer kp5.Close()
+	krp2, err := link.Kretprobe("tcp_recvmsg", bpfObjs.KretprobeTcpRecvmsg, nil)
+	if err != nil {
+		log.Fatalf("opening kprobe: %s", err)
+	}
+	defer krp2.Close()
 
 	// Print the contents of the BPF hash map (source IP address -> packet count).
 	ticker := time.NewTicker(1 * time.Second)
@@ -111,18 +140,25 @@ func formatMapContents(o *tcpconnectObjects) (string, error) {
 		saddr := formatIPv4Address(key.SaddrL)
 		daddr := formatIPv4Address(key.DaddrL)
 
-		var rtt uint32
-		tm.Lookup(&key, &rtt)
+		var tcpStats tcpconnectTcpStatsT
+		tm.Lookup(&key, &tcpStats)
+
+		var connStats tcpconnectConnStatsTsT
+		cm.Lookup(&key, &connStats)
 
 		sb.WriteString(
-			fmt.Sprintf("\tPID:%d\t%s\t%s:%d => %s:%d RTT: %dnsec\n",
+			fmt.Sprintf("\tPID:%d (%s)\t%s\t%s:%d => %s:%d (%s) RTT: %dnsec Send: %dbyte Recv: %dbyte\n",
 				key.Pid,
+				key.Comm,
 				formatTimestamp(val.Timestamp),
 				saddr,
 				key.Sport,
 				daddr,
 				key.Dport,
-				rtt,
+				getTcpStateById(tcpStats.State),
+				tcpStats.Rtt,
+				connStats.SentBytes,
+				connStats.RecvBytes,
 			))
 	}
 
@@ -141,4 +177,36 @@ func formatIPv4Address(addr uint64) string {
 func formatTimestamp(ts uint64) string {
 	t := time.Unix(int64(bootTimeSec), int64(ts))
 	return t.Format(time.RFC3339Nano)
+}
+
+func getTcpStateById(state uint16) string {
+	switch state {
+	case TCP_ESTABLISHED:
+		return "ESTABLISHED"
+	case TCP_SYN_SENT:
+		return "SYN_SENT"
+	case TCP_SYN_RECV:
+		return "SYN_RECV"
+	case TCP_FIN_WAIT1:
+		return "FIN_WAIT1"
+	case TCP_FIN_WAIT2:
+		return "FIN_WAIT2"
+	case TCP_TIME_WAIT:
+		return "TIME_WAIT"
+	case TCP_CLOSE:
+		return "CLOSE"
+	case TCP_CLOSE_WAIT:
+		return "CLOSE_WAIT"
+	case TCP_LAST_ACK:
+		return "LAST_ACK"
+	case TCP_LISTEN:
+		return "LISTEN"
+	case TCP_CLOSING:
+		return "CLOSING"
+	case TCP_NEW_SYN_RECV:
+		return "NEW_SYN_RECV"
+	case TCP_MAX_STATES:
+		return "MAX_STATES"
+	}
+	return "UNKN"
 }

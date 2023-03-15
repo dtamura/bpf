@@ -19,20 +19,10 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 struct
 {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(key_size, sizeof(__u32));
-	__uint(value_size, sizeof(__u32));
-	__uint(max_entries, 1);
-	__uint(pinning, LIBBPF_PIN_BY_NAME);
-} pkt_counter SEC(".maps");
-
-struct
-{
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, __u64);
 	__type(value, struct sock *);
 	__uint(max_entries, 1024);
-	// __uint(pinning, LIBBPF_PIN_BY_NAME);
 } tcp_ongoing_connect_pid SEC(".maps");
 
 // ref: https://github.com/DataDog/datadog-agent/blob/main/pkg/network/ebpf/c/tracer.h
@@ -58,6 +48,7 @@ typedef struct
 	__u16 dport;
 	__u32 netns;
 	__u32 pid;
+	__u8 comm[TASK_COMM_LEN]; // 追加
 	// Metadata description:
 	// First bit indicates if the connection is TCP (1) or UDP (0)
 	// Second bit indicates if the connection is V6 (1) or V4 (0)
@@ -81,7 +72,7 @@ typedef struct
 {
 	__u64 sent_bytes;
 	__u64 recv_bytes;
-	__u64 timestamp;
+	__u64 timestamp; // 最終更新
 	__u64 sent_packets;
 	__u64 recv_packets;
 	__u8 direction;
@@ -111,15 +102,14 @@ typedef struct
 	__u32 rtt;
 	__u32 rtt_var;
 
-	// Bit mask containing all TCP state transitions tracked by our tracer
-	__u16 state_transitions;
+	__u16 state;
 } tcp_stats_t;
 void init_tcp_stats(tcp_stats_t *t)
 {
 	t->retransmits = 0;
 	t->rtt = 0;
 	t->rtt_var = 0;
-	t->state_transitions = 0;
+	t->state = 0;
 }
 struct
 {
@@ -146,12 +136,24 @@ struct
 	__uint(max_entries, 1024);
 } tcp_sendmsg_args SEC(".maps");
 
+// tcp_recvmsg() 用のskp格納用
+struct
+{
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u64);
+	__type(value, struct sock *);
+	__uint(max_entries, 1024);
+} tcp_recvmsg_args SEC(".maps");
+
 // struct sockからコネクション情報を読み出す
 // 成功で1, 失敗は0を返却
 static __always_inline int read_conn_tuple(conn_tuple_t *t, struct sock *skp, u64 pid_tgid)
 {
 	// pid
 	t->pid = pid_tgid >> 32;
+
+	// comm
+	bpf_get_current_comm(&t->comm, sizeof(t->comm));
 
 	// netns
 	struct net *ct_net = NULL;
@@ -179,9 +181,14 @@ static __always_inline int read_conn_tuple(conn_tuple_t *t, struct sock *skp, u6
 	}
 	else
 	{
-		bpf_printk("ERR: not ipv4 family: __skc_family=%u", family);
+		// bpf_printk("ERR: not ipv4 family: __skc_family=%u", family);
 		return 0;
 	}
+
+	// IPフィルタリング
+	// if (t->daddr_l != 2647656349) { // 157.7.208.157 (inet-ip.info)
+	// 	return 0;
+	// }
 
 	// port
 	__u16 dport = 0;
@@ -225,9 +232,9 @@ static __always_inline void update_tcp_stats(conn_tuple_t *key, tcp_stats_t stat
 		val->rtt_var = stats.rtt_var >> 2;
 	}
 
-	if (stats.state_transitions > 0)
+	if (stats.state > 0)
 	{
-		val->state_transitions |= stats.state_transitions;
+		val->state = stats.state;
 	}
 }
 
@@ -286,7 +293,7 @@ static __always_inline __attribute__((unused)) void cleanup_conn(conn_tuple_t *t
 		bpf_map_delete_elem(&tcp_stats, &(conn.tup));
 	}
 
-	conn.tcp_stats.state_transitions |= (1 << TCP_CLOSE);
+	conn.tcp_stats.state = TCP_CLOSE;
 
 	// conn_statsからクリア
 	cst = bpf_map_lookup_elem(&conn_stats, &(conn.tup));
@@ -295,6 +302,24 @@ static __always_inline __attribute__((unused)) void cleanup_conn(conn_tuple_t *t
 		conn.conn_stats = *cst;
 		bpf_map_delete_elem(&conn_stats, &(conn.tup));
 	}
+}
+
+int __always_inline handle_tcp_recv(u64 pid_tgid, struct sock *skp, int recv)
+{
+
+	// コネクション情報取得
+	conn_tuple_t t = {};
+	if (!read_conn_tuple(&t, skp, pid_tgid))
+	{
+		return 0;
+	}
+
+	// TCP統計値の取得・更新
+	handle_tcp_stats(&t, skp, 0);
+
+	// コネクション情報の更新
+	// 送信 0 byte, 受信 recv byte
+	return handle_message(&t, 0, recv, skp);
 }
 
 /*****************************************/
@@ -358,32 +383,29 @@ int BPF_KRETPROBE(kretprobe__tcp_v4_connect, long ret)
 
 /*****************************************/
 
-SEC("kprobe/tcp_finish_connect")
-int BPF_KPROBE(kprobe__tcp_finish_connect, struct sock *sk, struct sk_buff *skb)
-{
-	struct sock *skp = sk;
+// SEC("kprobe/tcp_finish_connect")
+// int BPF_KPROBE(kprobe__tcp_finish_connect, struct sock *sk, struct sk_buff *skb) {
+// 	struct sock *skp = sk;
 
-	// pid_tgid へのポインタをルックアップ
-	u64 *pid_tgid_p = bpf_map_lookup_elem(&tcp_ongoing_connect_pid, &skp);
-	if (!pid_tgid_p)
-	{
-		return 0;
-	}
-	u64 pid_tgid = *pid_tgid_p;
-	bpf_map_delete_elem(&tcp_ongoing_connect_pid, &skp);
-	bpf_printk("kprobe/tcp_finish_connect: tgid: %u, pid: %u\n", pid_tgid >> 32, pid_tgid & 0xFFFFFFFF);
+// 	// pid_tgid へのポインタをルックアップ
+// 	u64 *pid_tgid_p = bpf_map_lookup_elem(&tcp_ongoing_connect_pid, &skp);
+// 	if (!pid_tgid_p) {
+// 		return 0;
+// 	}
+// 	u64 pid_tgid = *pid_tgid_p;
+// 	bpf_map_delete_elem(&tcp_ongoing_connect_pid, &skp);
+// 	bpf_printk("kprobe/tcp_finish_connect: tgid: %u, pid: %u\n", pid_tgid >> 32, pid_tgid & 0xFFFFFFFF);
 
-	conn_tuple_t key = {};
-	init_conn_tuple_t(&key);
-	if (!read_conn_tuple(&key, skp, pid_tgid))
-	{
-		return 0;
-	}
-	handle_tcp_stats(&key, skp, 0);
-	handle_message(&key, 0, 0, skp);
+// 	conn_tuple_t key = {};
+// 	init_conn_tuple_t(&key);
+// 	if (!read_conn_tuple(&key, skp, pid_tgid)) {
+// 		return 0;
+// 	}
+// 	handle_tcp_stats(&key, skp, 0);
+// 	handle_message(&key, 0, 0, skp);
 
-	return 0;
-}
+// 	return 0;
+// }
 
 /*****************************************/
 SEC("kprobe/tcp_sendmsg")
@@ -422,13 +444,14 @@ int BPF_KRETPROBE(kretprobe__tcp_sendmsg, long ret)
 		return 0;
 	}
 
-	bpf_printk("kretprobe/tcp_sendmsg: pid_tgid: %d, sent: %d, sock: %x\n", pid_tgid >> 32, ret, skp);
+	// コネクション情報の取得
 	conn_tuple_t key = {};
 	init_conn_tuple_t(&key);
 	if (!read_conn_tuple(&key, skp, pid_tgid))
 	{
 		return 0;
 	}
+	// bpf_printk("kretprobe/tcp_sendmsg: pid_tgid: %d, sent: %d, sock: %x\n", pid_tgid >> 32, ret, skp);
 
 	handle_tcp_stats(&key, skp, 0);
 
@@ -437,6 +460,8 @@ int BPF_KRETPROBE(kretprobe__tcp_sendmsg, long ret)
 	BPF_CORE_READ_INTO(&packets_out, (struct tcp_sock *)(skp), segs_out);
 	BPF_CORE_READ_INTO(&packets_in, (struct tcp_sock *)(skp), segs_in);
 
+	// コネクション情報の更新
+	// 送信 ret byte, 受信 0 byte
 	return handle_message(&key, ret, 0, skp);
 }
 
@@ -446,7 +471,7 @@ SEC("kprobe/tcp_set_state")
 int BPF_KPROBE(kprobe__tcp_set_state, struct sock *sk, int state)
 {
 	struct sock *skp = sk;
-	u8 new_state = (u8)state;
+	u8 __attribute__((unused)) new_state = (u8)state;
 	u64 pid_tgid = bpf_get_current_pid_tgid();
 	conn_tuple_t key = {};
 	init_conn_tuple_t(&key);
@@ -459,9 +484,9 @@ int BPF_KPROBE(kprobe__tcp_set_state, struct sock *sk, int state)
 	u8 old_state = 0;
 	BPF_CORE_READ_INTO(&old_state, skp, __sk_common.skc_state);
 
-	bpf_printk("kprobe/tcp_set_state: state: %u => %u\n", old_state, new_state);
+	// bpf_printk("kprobe/tcp_set_state: state: %u => %u\n", old_state, new_state);
 
-	tcp_stats_t stats = {.state_transitions = (1 << state)};
+	tcp_stats_t stats = {.state = state};
 	update_tcp_stats(&key, stats);
 
 	return 0;
@@ -493,4 +518,47 @@ int BPF_KPROBE(kprobe__tcp_close, struct sock *sk, long timeout)
 	// cleanup_conn(&key, skp);
 
 	return 0;
+}
+
+/********************************************/
+// ref https://elixir.bootlin.com/linux/v5.15.102/source/include/linux/socket.h#L291
+#define MSG_PEEK 2
+
+SEC("kprobe/tcp_recvmsg")
+int BPF_KPROBE(kprobe__tcp_recvmsg, struct sock *sk, struct msghdr *msg, size_t len, int flags, int *addr_len)
+{
+	struct sock *skp = sk;
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+
+	// cf: https://manpages.ubuntu.com/manpages/impish/ja/man2/recv.2.html
+
+	if (flags & MSG_PEEK)
+	{
+		return 0;
+	}
+
+	bpf_map_update_elem(&tcp_recvmsg_args, &pid_tgid, &skp, BPF_ANY);
+
+	return 0;
+}
+
+SEC("kretprobe/tcp_recvmsg")
+int BPF_KRETPROBE(kretprobe__tcp_recvmsg, long ret)
+{
+
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct sock **skpp = (struct sock **)bpf_map_lookup_elem(&tcp_recvmsg_args, &pid_tgid);
+	if (!skpp)
+	{
+		return 0;
+	}
+
+	struct sock *skp = *skpp;
+	bpf_map_delete_elem(&tcp_recvmsg_args, &pid_tgid);
+	if (!skp)
+	{
+		return 0;
+	}
+
+	return handle_tcp_recv(pid_tgid, skp, ret);
 }
